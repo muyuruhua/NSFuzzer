@@ -1,0 +1,44 @@
+# ============================================
+# NSFuzzer .gitignore
+# ============================================
+
+# ── Large experiment data archives (root level) ──
+NSFuzz/*.tar.gz
+
+# ── Zenodo refresh data (~11GB) ──
+NSFuzz/refresh_zenodo_7134490/
+
+# ── Fuzzing result archives in execution directories ──
+NSFuzz/scripts/execution/**/out-*.tar.gz
+
+# ── State variable range JSON data files ──
+NSFuzz/scripts/execution/**/*_sv_range_*.json
+
+# ── Generated analysis outputs (can be regenerated) ──
+NSFuzz/scripts/execution/**/results.csv
+NSFuzz/scripts/execution/**/states.csv
+NSFuzz/scripts/execution/**/mean_plot_data.csv
+NSFuzz/scripts/execution/**/fuzzer_summary.csv
+NSFuzz/scripts/execution/**/ipsm_summary.csv
+NSFuzz/scripts/execution/**/sv_range_summary.csv
+NSFuzz/scripts/execution/**/run_summary.csv
+NSFuzz/scripts/execution/**/*.png
+
+# ── Timestamped result snapshot directories ──
+NSFuzz/scripts/res_*/
+
+# ── Extracted nsfuzz source (embedded git repo, from Docker image) ──
+NSFuzz/scripts/build/*/nsfuzz-source/
+
+# ── Compiled binaries and object files ──
+*.o
+*.so
+*.pyc
+__pycache__/
+
+# ── Lock files ──
+.~lock*
+
+# ── OS artifacts ──
+.DS_Store
+Thumbs.db

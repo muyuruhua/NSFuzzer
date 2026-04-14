@@ -1,0 +1,40 @@
+1. Load the images
+
+	docker load --input bftpd.tar.gz
+	docker load --input dcmtk.tar.gz
+	docker load --input dnsmasq.tar.gz
+	docker load --input exim.tar.gz
+	docker load --input forked-daapd.tar.gz
+	docker load --input kamailio.tar.gz
+	docker load --input lightftp.tar.gz
+	docker load --input live555.tar.gz
+	docker load --input openssh.tar.gz
+	docker load --input openssl.tar.gz
+	docker load --input proftpd.tar.gz
+	docker load --input pure-ftpd.tar.gz
+	docker load --input tinydtls.tar.gz
+	docker load --input static-analysis.tar.gz
+	
+2. Setup the environment
+
+	echo core > /proc/sys/kernel/core_pattern
+	echo 0 | tee /proc/sys/kernel/randomize_va_space
+
+3. Install the required python packages
+
+	pip3 install -r requirements.txt
+	
+4. (Recommended for strict comparison) Verify protocol image versions
+
+	bash scripts/execution/verify_protocol_image_version.sh lightftp
+	bash scripts/execution/verify_protocol_image_version.sh bftpd
+	bash scripts/execution/verify_protocol_image_version.sh proftpd
+	bash scripts/execution/verify_protocol_image_version.sh pure-ftpd
+	bash scripts/execution/verify_protocol_image_version.sh exim
+	bash scripts/execution/verify_protocol_image_version.sh live555
+	bash scripts/execution/verify_protocol_image_version.sh kamailio
+	bash scripts/execution/verify_protocol_image_version.sh forked-daapd
+
+	# strict version checking is enabled by default in execution scripts.
+	# disable only when needed:
+	# export STRICT_PROTOCOL_VERSION=0

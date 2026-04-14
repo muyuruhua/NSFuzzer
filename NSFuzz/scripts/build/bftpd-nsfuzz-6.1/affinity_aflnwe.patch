@@ -1,0 +1,80 @@
+diff --git a/afl-fuzz.c b/afl-fuzz.c
+index c328f90..11f074b 100644
+--- a/afl-fuzz.c
++++ b/afl-fuzz.c
+@@ -700,11 +700,11 @@ static void bind_to_free_cpu(void) {
+ 
+   }
+ 
+-  d = opendir("/proc");
++  d = opendir("/host/proc");
+ 
+   if (!d) {
+ 
+-    WARNF("Unable to access /proc - can't scan for free CPU cores.");
++    WARNF("Unable to access /host/proc - can't scan for free CPU cores.");
+     return;
+ 
+   }
+@@ -716,7 +716,7 @@ static void bind_to_free_cpu(void) {
+ 
+   usleep(R(1000) * 250);
+ 
+-  /* Scan all /proc/<pid>/status entries, checking for Cpus_allowed_list.
++  /* Scan all /host/proc/<pid>/status entries, checking for Cpus_allowed_list.
+      Flag all processes bound to a specific CPU using cpu_used[]. This will
+      fail for some exotic binding setups, but is likely good enough in almost
+      all real-world use cases. */
+@@ -730,7 +730,7 @@ static void bind_to_free_cpu(void) {
+ 
+     if (!isdigit(de->d_name[0])) continue;
+ 
+-    fn = alloc_printf("/proc/%s/status", de->d_name);
++    fn = alloc_printf("/host/proc/%s/status", de->d_name);
+ 
+     if (!(f = fopen(fn, "r"))) {
+       ck_free(fn);
+@@ -3892,11 +3892,11 @@ static double get_runnable_processes(void) {
+ 
+ #else
+ 
+-  /* On Linux, /proc/stat is probably the best way; load averages are
++  /* On Linux, /host/proc/stat is probably the best way; load averages are
+      computed in funny ways and sometimes don't reflect extremely short-lived
+      processes well. */
+ 
+-  FILE* f = fopen("/proc/stat", "r");
++  FILE* f = fopen("/host/proc/stat", "r");
+   u8 tmp[1024];
+   u32 val = 0;
+ 
+@@ -7605,7 +7605,7 @@ static void check_crash_handling(void) {
+   /* This is Linux specific, but I don't think there's anything equivalent on
+      *BSD, so we can just let it slide for now. */
+ 
+-  s32 fd = open("/proc/sys/kernel/core_pattern", O_RDONLY);
++  s32 fd = open("/host/proc/sys/kernel/core_pattern", O_RDONLY);
+   u8  fchar;
+ 
+   if (fd < 0) return;
+@@ -7621,9 +7621,9 @@ static void check_crash_handling(void) {
+          "    fuzzer via the standard waitpid() API.\n\n"
+ 
+          "    To avoid having crashes misinterpreted as timeouts, please log in as root\n" 
+-         "    and temporarily modify /proc/sys/kernel/core_pattern, like so:\n\n"
++         "    and temporarily modify /host/proc/sys/kernel/core_pattern, like so:\n\n"
+ 
+-         "    echo core >/proc/sys/kernel/core_pattern\n");
++         "    echo core >/host/proc/sys/kernel/core_pattern\n");
+ 
+     if (!getenv("AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES"))
+       FATAL("Pipe at the beginning of 'core_pattern'");
+@@ -7726,7 +7726,7 @@ static void get_core_count(void) {
+ 
+ #else
+ 
+-  FILE* f = fopen("/proc/stat", "r");
++  FILE* f = fopen("/host/proc/stat", "r");
+   u8 tmp[1024];
+ 
+   if (!f) return;

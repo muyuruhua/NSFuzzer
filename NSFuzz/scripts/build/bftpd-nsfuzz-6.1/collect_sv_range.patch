@@ -1,0 +1,1494 @@
+diff --git a/afl-fuzz.c b/afl-fuzz.c
+index 34337244525f..548cc7248ffe 100644
+--- a/afl-fuzz.c
++++ b/afl-fuzz.c
+@@ -150,6 +150,7 @@ static s32 forksrv_pid,               /* PID of the fork server           */
+            out_dir_fd = -1;           /* FD of the lock file              */
+ 
+ EXP_ST u8* trace_bits;                /* SHM with instrumentation bitmap  */
++EXP_ST u8* state_range_trace_bits;
+ 
+ EXP_ST u8  virgin_bits[MAP_SIZE],     /* Regions yet untouched by fuzzing */
+            virgin_tmout[MAP_SIZE],    /* Bits we haven't seen in tmouts   */
+@@ -158,6 +159,7 @@ EXP_ST u8  virgin_bits[MAP_SIZE],     /* Regions yet untouched by fuzzing */
+ static u8  var_bytes[MAP_SIZE];       /* Bytes that appear to be variable */
+ 
+ static s32 shm_id;                    /* ID of the SHM region             */
++static s32 shm_state_range_id;
+ 
+ static volatile u8 stop_soon,         /* Ctrl-C pressed?                  */
+                    clear_screen = 1,  /* Window resized?                  */
+@@ -2053,6 +2055,22 @@ static void remove_shm(void) {
+ 
+ }
+ 
++static void remove_state_range_shm(void) {
++	int i, j;
++	FILE *fp = NULL;
++	fp = fopen("/tmp/sv_range.txt", "w");
++	for (i = 0; i < SV_CNT; ++i) {
++		for (j = 0; j < MAP_SIZE; ++j) {
++			if (state_range_trace_bits[i * MAP_SIZE + j]) {
++				fprintf(fp, "%d %d\n", i, j);
++			}
++		}
++	}
++	fclose(fp);
++
++	shmctl(shm_state_range_id, IPC_RMID, NULL);
++}
++
+ 
+ /* Compact trace bytes into a smaller bitmap. We effectively just drop the
+    count information here. This is called only sporadically, for some
+@@ -2226,6 +2244,24 @@ EXP_ST void setup_shm(void) {
+ 
+   if (!trace_bits) PFATAL("shmat() failed");
+ 
++  u8 *shm_state_range_str;
++
++  shm_state_range_id = shmget(IPC_PRIVATE, SV_CNT * MAP_SIZE, IPC_CREAT | IPC_EXCL | 0600);
++
++  if (shm_state_range_id < 0)
++    PFATAL("shmget() failed");
++
++  atexit(remove_state_range_shm);
++
++  shm_state_range_str = alloc_printf("%d", shm_state_range_id);
++
++  if (!dumb_mode) setenv(SHM_STATE_RANGE_VAR, shm_state_range_str, 1);
++
++  ck_free(shm_state_range_str);
++
++  state_range_trace_bits = shmat(shm_state_range_id, NULL, 0);
++
++  if (!state_range_trace_bits) PFATAL("shmat() failed");
+ }
+ 
+ 
+@@ -9110,6 +9146,8 @@ int main(int argc, char** argv) {
+ 
+   setup_ipsm();
+ 
++  memset(state_range_trace_bits, 0, SV_CNT * MAP_SIZE);
++
+   setup_dirs_fds();
+   read_testcases();
+   load_auto();
+diff --git a/annotation-pass.so b/annotation-pass.so
+new file mode 100755
+index 000000000000..e69de29bb2d1
+diff --git a/config.h b/config.h
+index b21298df7cf6..c192fc28f53e 100644
+--- a/config.h
++++ b/config.h
+@@ -277,6 +277,8 @@
+ /* Environment variable used to pass SHM ID to the called program. */
+ 
+ #define SHM_ENV_VAR         "__AFL_SHM_ID"
++#define SHM_STATE_RANGE_VAR "__AFL_STATE_RANGE_SHM_ID"
++#define SV_CNT		20
+ 
+ /* Other less interesting, internal-only variables. */
+ 
+diff --git a/llvm_mode/Annotation.cc b/llvm_mode/Annotation.cc
+new file mode 100644
+index 000000000000..a3baa1324f85
+--- /dev/null
++++ b/llvm_mode/Annotation.cc
+@@ -0,0 +1,520 @@
++/*
++ * Annotation utility functions
++ *
++ * Copyright (C) 2012 Xi Wang, Haogang Chen, Nickolai Zeldovich
++ * Copyright (C) 2015 - 2016 Chengyu Song 
++ *
++ * For licensing details see LICENSE
++ */
++
++
++#include <llvm/IR/Module.h>
++#include <llvm/IR/Instructions.h>
++#include <llvm/IR/IntrinsicInst.h>
++#include <llvm/IR/Metadata.h>
++#include <llvm/IR/Constants.h>
++#include <llvm/IR/Type.h>
++#include <llvm/Pass.h>
++#include <llvm/Analysis/ValueTracking.h>
++#include <llvm/IR/InstIterator.h>
++#include <llvm/Support/Debug.h>
++#include <llvm/Support/raw_ostream.h>
++#include <llvm/ADT/DenseMap.h>
++#include <llvm/ADT/SmallVector.h>
++#include <llvm/ADT/SmallPtrSet.h>
++#include <llvm/Transforms/Utils/Local.h>
++
++#include "Annotation.h"
++
++using namespace llvm;
++
++#define Diag llvm::errs()
++
++//
++// Functions will be included under 2 criteria:
++// 1. primitive allocators, e.g., kmalloc
++// 2. wrapper allocator that does not directly
++//    return the results from primitive allocator,
++//    e.g., devres_alloc
++//
++// flag stores the arg number of the flag operand
++// size stores the arg number of the size operand
++//
++bool isAllocFn(StringRef name, int *size, int *flag) {
++	
++	// kmalloc
++	// don't handle variable length yet
++	if (!name.compare("kmalloc_array") ||
++		!name.compare("kcalloc"))
++		return false;
++
++	if (name.startswith("kmalloc") ||
++		name.startswith("__kmalloc") ||
++		name.startswith("kzalloc")) {
++		*size = 0;
++		*flag = 1;
++		return true;
++	}
++
++	// kmem_cache_alloc
++	if (name.startswith("kmem_cache_alloc") ||
++		!name.compare("kmem_cache_zalloc")) {
++		*size = -1;
++		*flag = 1;
++		return true;
++	}
++
++	// kmemdup
++	if (!name.compare("kmemdup")) {
++		*size = 1;
++		*flag = 2;
++		return true;
++	}
++
++	if (!name.compare("kstrndup") ||
++	    !name.compare("kstrdup"))
++		return false;
++
++	if (!name.compare("krealloc") ||
++		!name.compare("__krealloc")) {
++		*size = 1;
++		*flag = 2;
++		return true;
++	}
++	
++	// driver/base
++	if (!name.compare("devm_kzalloc") ||
++		!name.compare("alloc_dr") ||
++		!name.compare("__devres_alloc") ||
++		!name.compare("devres_alloc")) {
++		*size = 1;
++		*flag = 2;
++		return true;
++	}
++
++#if 0
++	// page alloc
++	if (!name.compare("__get_free_pages") ||
++		!name.compare("get_zeroed_page"))
++		return 1;
++
++	if (!name.compare("__alloc_pages_nodemask") ||
++		!name.compare("__alloc_pages") ||
++		!name.compare("alloc_pages_current") ||
++		!name.compare("alloc_pages") ||
++		!name.compare("alloc_pages_vma"))
++		return 1;
++
++	if (!name.compare("alloc_pages_node") ||
++		!name.compare("alloc_pages_exact_node") ||
++		!name.compare("alloc_pages_exact") ||
++		!name.compare("alloc_pages_exact_nid"))
++		return 2;
++
++	// pagemap
++	if (!name.compare("__page_cache_alloc"))
++		return 1;
++
++	if (!name.compare("find_or_create_page"))
++		return 3;
++
++	// vmalloc
++	if (name.startswith("vmalloc") ||
++		name.startswith("vzalloc"))
++		return -1; // don't really have flags
++
++	if (!name.compare("__vmalloc"))
++		return 2;
++
++	if (!name.compare("__vmalloc_node_range"))
++		return 5;
++
++#if 0
++	// DMA related
++	if (!name.compare("dmam_alloc_coherent") ||
++		!name.compare("dmam_alloc_noncoherent") ||
++		!name.compare("dma_alloc_coherent") ||
++		!name.compare("dma_alloc_at_attrs") ||
++		!name.compare("dma_alloc_attrs") ||
++		!name.compare("arm_dma_alloc") ||
++		!name.compare("dma_alloc_writecombine") ||
++		(name.find("swiotlb_alloc_coherent") != llvm::StringRef::npos) ||
++		!name.compare("arm_coherent_dma_alloc"))
++		return 4;
++
++	if (!name.compare("dma_pool_alloc"))
++		return 2;
++#endif
++
++	// bootmem
++	if (name.find("alloc_bootmem") != llvm::StringRef::npos)
++		return -1;
++#endif
++
++	// bio
++	if (!name.compare("bio_alloc_bioset")) {
++		*size = -1;
++		*flag = 0;
++		return true;
++	}
++
++	if (!name.compare("hcd_buffer_alloc")) {
++		*size = 1;
++		*flag = 2;
++		return false;
++	}
++
++	if (!name.compare("sk_prot_alloc")) {
++		*size = -1;
++		*flag = 1;
++		return true;
++	}
++
++	if (!name.compare("sk_alloc")) {
++		*size = -1;
++		*flag = 2;
++		return true;
++	}
++
++	// mempool
++	// XXX needs special care
++	if (!name.compare("mempool_alloc")) {
++		*size = -1;
++		*flag = 1;
++		return false;
++	}
++
++	if (!name.compare("mempool_alloc_slab") ||
++		!name.compare("mempool_kmalloc")) {
++		*size = -1;
++		*flag = 0;
++		return true;
++	}
++
++	if (!name.compare("mempool_alloc_pages"))
++		return false;
++
++	return false;
++}
++
++
++std::string getStoreId(StoreInst *SI) {
++	StringRef Id = getLoadStoreId(SI);
++	// Diag << "STId:  " << Id << "\n";
++	if (!Id.empty()){
++		// Diag << "Non Empty STId:  " << Id << "\n\n";
++		return Id.str();
++	}
++
++	std::string Anno;
++	LLVMContext &VMCtx = SI->getContext();
++	Module *M = SI->getParent()->getParent()->getParent();
++	Value *V = SI->getPointerOperand();
++	// Diag << "SIValue:  " << *V << "\n";
++	// Type *VT = V->getType();
++	// Diag << "SIValueType:  " << *VT << "\n";
++	// Type *SIT = SI->getType();
++	// Diag << "SIType:  " << *SIT << "\n";
++	Anno = getAnnotation(V, M);
++	// Diag << "STAnno:  " << Anno << "\n\n";
++	if (Anno.empty())
++		return Anno;
++
++	MDNode *MD = MDNode::get(VMCtx, MDString::get(VMCtx, Anno));
++	SI->setMetadata(MD_ID, MD);
++	return Anno;
++}
++
++std::string getLoadId(LoadInst *LI) {
++	StringRef Id = getLoadStoreId(LI);
++	// Diag << "LDId:  " << Id << "\n";
++	if (!Id.empty()){
++		// Diag << "Non Empty LDId:  " << Id << "\n\n";
++		return Id.str();
++	}
++	std::string Anno;
++	LLVMContext &VMCtx = LI->getContext();
++	Module *M = LI->getParent()->getParent()->getParent();
++	Value *V = LI->getPointerOperand();
++	// Diag << "LIValue:  " << *V << "\n";
++	// Type *VT = V->getType();
++	// Diag << "LIValueType:  " << *VT << "\n";
++	// Type *LIT = LI->getType();
++	// Diag << "LIType:  " << *LIT << "\n";
++	Anno = getAnnotation(V, M);
++	// Diag << "LDAnno:  " << Anno << "\n";
++	if (Anno.empty())
++		return Anno;
++
++	MDNode *MD = MDNode::get(VMCtx, MDString::get(VMCtx, Anno));
++	LI->setMetadata(MD_ID, MD);
++	// Diag << "LDAnno:  " << Anno << "\n";
++	return Anno;
++}
++
++std::string getStructId(Value *PVal, User::op_iterator &IS, User::op_iterator &IE, Module *M) {
++
++	Type *Ptr = PVal->getType();
++    const PointerType *PTy = dyn_cast<PointerType>(Ptr);
++	StructType *STy = nullptr;
++	for (++IE; IS != IE; ++IS) {
++        // Diag << "IS IE: " << *IS << " " << *IE << "\n";
++        if (!PTy) break;
++        // Diag << "PTy: " << *PTy << "\n";
++		CompositeType *CT = dyn_cast<CompositeType>(PTy->getElementType());
++		if (!CT) break;
++        // Diag << "CT: "<< *CT << "\n";
++		if ((STy = dyn_cast<StructType>(CT))) break;
++		if (!CT->indexValid(*IS)) break;
++		Ptr = CT->getTypeAtIndex(*IS);
++        PTy = dyn_cast<PointerType>(Ptr);
++	}
++    // if (STy != nullptr)
++    //     Diag << "STy isOpaque isLiteral: "<< *STy << STy->isOpaque() << STy->isLiteral() << "\n";
++    // else
++    //     Diag << "STy empty\n";
++	if (STy && !STy->isOpaque() && !STy->isLiteral()) {
++		std::string out;
++		raw_string_ostream rso(out);
++
++		std::string structName = STy->getStructName().str();
++        // Diag << "structName: " << structName << "\n";
++		if (structName.find("struct.anon") == 0) {
++			structName = getScopeName(STy, M);
++			structName = getAnonStructId(PVal, M, structName);
++		} else if (structName.find("struct.hlist_") == 0||
++			!structName.compare("struct.list_head") ||
++			!structName.compare("struct.atomic_t") ||
++			!structName.compare("struct.atomic64_t")) {
++			structName = getAnonStructId(PVal, M, "");
++			if (structName.empty())
++				return "";
++		}
++
++		rso << structName;
++		for (; IS != IE; ++IS) {
++			rso << ",";
++			ConstantInt *Idx = dyn_cast<ConstantInt>(*IS);
++			if (Idx)
++				rso << Idx->getZExtValue();
++			else
++				(*IS)->printAsOperand(rso);
++		}
++		return rso.str();
++	}
++	return "";
++}
++
++std::string getAnonStructId(Value *V, Module *M, StringRef Prefix) {
++	
++	SmallPtrSet<Value*, 4> Visited;
++	SmallVector<Value*, 4> WorkList;
++
++	Visited.insert(V);
++	WorkList.push_back(V);
++
++	while (!WorkList.empty()) {
++		Value *v = WorkList.pop_back_val();
++
++		// only handle GEP and cast
++		User::op_iterator is, ie; // GEP indices
++		Value *PVal = NULL;       // Pointer operand in the GEP
++		if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(v)) {
++			// GEP instruction
++			is = GEP->idx_begin();
++			ie = GEP->idx_end() - 1;
++			PVal = GEP->getPointerOperand();
++		} else if (ConstantExpr *CE = dyn_cast<ConstantExpr>(v)) {
++			// constant GEP expression
++			if (CE->getOpcode() == Instruction::GetElementPtr) {
++				is = CE->op_begin() + 1;
++				ie = CE->op_end() - 1;
++				PVal = CE->getOperand(0);
++			} else if (CE->isCast()) {
++				if (Visited.insert(CE->getOperand(0)).second)
++					WorkList.push_back(CE->getOperand(0));
++				continue;
++			}
++		}
++
++		// id is in the form of struct.[name].[offset]
++		if (PVal) {
++			// prefer global over struct
++			if (GlobalValue *GV = dyn_cast<GlobalValue>(PVal)) {
++				return getVarId(GV);
++			}
++
++			std::string structId = getStructId(PVal, is, ie, M);
++			if (!structId.empty())
++				return structId;
++		}
++
++		if (CastInst *CI = dyn_cast<CastInst>(v)) {
++			if (Visited.insert(CI->getOperand(0)).second)
++				WorkList.push_back(CI->getOperand(0));
++			continue;
++		}
++
++#if 0
++		if (AllocaInst *AI = dyn_cast<AllocaInst>(v)) {
++			return getVarId(AI);
++		}
++
++		if (GlobalVariable *GV = dyn_cast<GlobalVariable>(v)) {
++			return getVarId(GV);
++		}
++
++		Type *Ty = v->getType();
++		while (Ty->isPointerTy())
++			Ty = Ty->getContainedType(0);
++		if (StructType *STy = dyn_cast<StructType>(Ty)) {
++			if (!STy->getStructName().startswith("struct.anon")) {
++				return STy->getStructName();
++			}
++		}
++#endif
++
++		WARNING("Invalid anon struct value " << *v << "\n");
++		break;
++	}
++
++	return Prefix;
++}
++
++std::string getAnnotation(Value *V, Module *M) {
++
++	SmallPtrSet<Value*, 16> Visited;
++	SmallVector<Value*, 8> WorkList;
++
++	Visited.insert(V);
++	WorkList.push_back(V);
++
++	while (!WorkList.empty()) {
++		Value *v = WorkList.pop_back_val();
++        // Diag << "current v:" << *v << "\n";
++
++		if (GlobalVariable *GV = dyn_cast<GlobalVariable>(v))
++        {
++            // Diag << "getVarId(GV): " << getVarId(GV) << "\n";
++			return getVarId(GV);
++        }
++
++        if (Argument *A = dyn_cast<Argument>(v)) {
++            // Diag << "getArgId(A): " << getArgId(A) << "\n";
++            return getArgId(A);
++        }
++
++                User::op_iterator is, ie; // GEP indices
++		Value *PVal = NULL;       // Pointer operand in the GEP
++		if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(v)) {
++			// GEP instruction
++			is = GEP->idx_begin();
++			ie = GEP->idx_end() - 1;
++			PVal = GEP->getPointerOperand();
++		} else if (ConstantExpr *CE = dyn_cast<ConstantExpr>(v)) {
++			// constant GEP expression
++			if (CE->getOpcode() == Instruction::GetElementPtr) {
++				is = CE->op_begin() + 1;
++				ie = CE->op_end() - 1;
++				PVal = CE->getOperand(0);
++			} else if (CE->isCast()) {
++				if (Visited.insert(CE->getOperand(0)).second)
++					WorkList.push_back(CE->getOperand(0));
++				continue;
++			}
++		}
++
++		// id is in the form of struct.[name].[offset]
++		if (PVal) {
++			std::string structId = getStructId(PVal, is, ie, M);
++			if (!structId.empty()) {
++				return structId;
++			} else {
++				if (Visited.insert(PVal).second)
++					WorkList.push_back(PVal);
++				//Instruction *i = cast<Instruction>(v);
++				//Function *f = i->getParent()->getParent();
++				// errs() << "Unsupported GEP: " << f->getName() << "::" << *i << "\n";
++				// errs() << "\t Pointer: " << *PVal << "\n";
++				continue;
++			}
++		}
++
++		if (AllocaInst *AI = dyn_cast<AllocaInst>(v)) {
++            // Diag << "getVarId(AI): " << getVarId(AI) << "\n";
++			return getVarId(AI);
++		}
++
++		if (CastInst *CI = dyn_cast<CastInst>(v)) {
++			if (Visited.insert(CI->getOperand(0)).second)
++				WorkList.push_back(CI->getOperand(0));
++			continue;
++		}
++
++		if (CallInst *CI = dyn_cast<CallInst>(v)) {
++			Value *CV = CI->getCalledValue();
++			// handle simple cast expr
++			if (ConstantExpr *CE = dyn_cast<ConstantExpr>(CV)) {
++				if (CE->isCast())
++					CV = CE->getOperand(0);
++			}
++			Function *F = dyn_cast<Function>(CV);
++			if (F != NULL) {
++				// check for alloc function
++				StringRef name = F->getName();
++				if (isAllocFn(name)) {
++					// return the loc
++					std::string loc;
++					raw_string_ostream rso(loc);
++					const DebugLoc &LOC = CI->getDebugLoc();
++					LOC.print(rso);
++                    // Diag << "LOC.print: " << rso.str() << "\n";
++					return rso.str();
++				} else {
++					// Diag << "getRetId(F): " << getRetId(F) << "\n";
++                    return getRetId(F);
++                }
++			}
++		}
++
++		if (LoadInst *LI = dyn_cast<LoadInst>(v)) {
++			Value *S = LI->getPointerOperand();
++			if (Visited.insert(S).second)
++				WorkList.push_back(S);
++			continue;
++		}
++
++		if (PHINode *PHI = dyn_cast<PHINode>(v)) {
++			for (unsigned i = 0, e = PHI->getNumIncomingValues(); i < e; ++i) {
++				if (Visited.insert(PHI->getIncomingValue(i)).second)
++					WorkList.push_back(PHI->getIncomingValue(i));
++			}
++			continue;
++		}
++
++		if (SelectInst *SEI = dyn_cast<SelectInst>(v)) {
++			if (Visited.insert(SEI->getTrueValue()).second)
++				WorkList.push_back(SEI->getTrueValue());
++			if (Visited.insert(SEI->getFalseValue()).second)
++				WorkList.push_back(SEI->getFalseValue());
++			continue;
++		}
++		if (BinaryOperator *BO = dyn_cast<BinaryOperator>(v)) {
++			// only when one of the operand is a constant int
++			if (isa<ConstantInt>(BO->getOperand(1))) {
++				if (Visited.insert(BO->getOperand(0)).second)
++					WorkList.push_back(BO->getOperand(0));
++				continue;
++			}
++			if (isa<ConstantInt>(BO->getOperand(0))) {
++				if (Visited.insert(BO->getOperand(1)).second)
++					WorkList.push_back(BO->getOperand(1));
++				continue;
++			}
++		}
++		// WARNING("Unsupported annotation source: " << *v << "\n");
++	}
++    // Diag << "std::string(): " << std::string() << "\n";
++	return std::string();
++}
++
+diff --git a/llvm_mode/Annotation.h b/llvm_mode/Annotation.h
+new file mode 100644
+index 000000000000..cb09a1af7c34
+--- /dev/null
++++ b/llvm_mode/Annotation.h
+@@ -0,0 +1,187 @@
++#ifndef _ANNOTATION_H
++#define _ANNOTATION_H
++
++#pragma once
++
++#include <llvm/IR/Value.h>
++#include <llvm/IR/Module.h>
++#include <llvm/IR/Type.h>
++#include <llvm/IR/Instructions.h>
++#include <llvm/IR/IntrinsicInst.h>
++#include <llvm/IR/Metadata.h>
++#include <llvm/Support/Path.h>
++#include <string>
++#include <llvm/Support/Debug.h>
++
++#include "Common.h"
++
++#define DEFAULT_SVLIST_PATH "/tmp/sv_list_temp"
++#define DEFAULT_GINDEX_PATH "/tmp/gsv_index"
++
++#define MD_TaintSrc   "taint_src"
++#define MD_Taint      "taint"
++#define MD_Sink       "sink"
++#define MD_ID         "id"
++#define MD_TBAA	      "tbaa"
++
++#define MD_NAME_INFO_OP 0
++#define MD_ARG_INFO_OP 1
++
++inline llvm::StringRef getStringFromMD(llvm::MDNode *MD, unsigned index=MD_NAME_INFO_OP) {
++	if (llvm::MDString *S = llvm::dyn_cast_or_null<llvm::MDString>(MD->getOperand(index)))
++		return S->getString();
++	return "";
++}
++
++static inline bool isFunctionPointer(llvm::Type *Ty) {
++	llvm::PointerType *PTy = llvm::dyn_cast<llvm::PointerType>(Ty);
++	return PTy && PTy->getElementType()->isFunctionTy();
++}
++
++static inline bool isFunctionPointerOrVoid(llvm::Type *Ty) {
++	llvm::PointerType *PTy = llvm::dyn_cast<llvm::PointerType>(Ty);
++	if (!PTy)
++		return false;
++
++	llvm::Type *subTy = PTy->getElementType();
++	if (subTy->isFunctionTy())
++		return true;
++
++	// FIXME should add something in clang to indicate real void*
++	// like in CPI
++	if (subTy->isIntegerTy(8))
++		return true;
++
++	return false;
++}
++
++static inline std::string getScopeName(const llvm::GlobalValue *GV) {
++	if (llvm::GlobalValue::isExternalLinkage(GV->getLinkage()))
++		return GV->getName();
++	else {
++		llvm::StringRef moduleName = llvm::sys::path::stem(
++			GV->getParent()->getModuleIdentifier());
++		return "_" + moduleName.str() + "." + GV->getName().str();
++	}
++}
++
++static inline std::string getScopeName(const llvm::Instruction *I) {
++	const llvm::Function *F = I->getParent()->getParent();
++	assert(F && "Cannot get Function");
++	llvm::StringRef moduleName = llvm::sys::path::stem(
++			F->getParent()->getModuleIdentifier());
++	if (I->hasName())
++		return "_" + moduleName.str() + "." + F->getName().str() + "." + I->getName().str();
++
++	return "_" + moduleName.str() + "." + F->getName().str() + ".anonymous";
++}
++
++// prefix anonymous struct name with module name
++static inline std::string getScopeName(const llvm::StructType *Ty, const llvm::Module *M) {
++	if (Ty->isLiteral())
++		return "";
++	llvm::StringRef structName = Ty->getStructName();
++	size_t dotPos = structName.rfind('.');
++	if (M && (structName.startswith("struct.anon") ||
++		structName.startswith("union.anon"))) {
++		llvm::StringRef rest = structName.substr(6);
++		llvm::StringRef moduleName = llvm::sys::path::stem(
++			M->getModuleIdentifier());
++		return "struct._" + moduleName.str() + rest.str();
++	}
++	if (dotPos != 0 && dotPos != llvm::StringRef::npos &&
++		structName.back() != '.' &&
++		isdigit(static_cast<unsigned char>(structName[dotPos + 1])))
++		structName = structName.substr(0, dotPos);
++	return structName.str();
++}
++
++static inline llvm::StringRef getLoadStoreId(const llvm::Instruction *I) {
++	if (llvm::MDNode *MD = I->getMetadata(MD_ID))
++		return getStringFromMD(MD);
++	return llvm::StringRef();
++}
++
++static inline std::string
++getStructId(llvm::StructType *STy, llvm::Module *M, unsigned offset) {
++	if (!STy || STy->isLiteral())
++		return "";
++	return getScopeName(STy, M) + "," + std::to_string(offset);
++}
++
++static inline std::string getStructId(llvm::Type *Ty, llvm::Module *M) {
++	if (Ty->isPointerTy()) {
++		Ty = Ty->getContainedType(0);
++		if (llvm::StructType *STy = llvm::dyn_cast<llvm::StructType>(Ty))
++			return getScopeName(STy, M);
++	}
++	return "";
++}
++
++static inline std::string getVarId(const llvm::GlobalValue *GV) {
++	return "var." + getScopeName(GV);
++}
++
++static inline std::string getVarId(llvm::AllocaInst *AI) {
++	return "lvar." + getScopeName(AI);
++}
++
++static inline std::string getArgId(llvm::Function *F, unsigned no) {
++	return "arg." + getScopeName(F) + "." + std::to_string(no);
++}
++
++static inline std::string getArgId(llvm::Argument *A) {
++	return getArgId(A->getParent(), A->getArgNo());
++}
++
++static inline std::string getRetId(llvm::Function *F) {
++	return "ret." + getScopeName(F);
++}
++
++static inline std::string getValueId(llvm::Value *V);
++static inline std::string getRetId(llvm::CallInst *CI) {
++	if (llvm::Function *CF = CI->getCalledFunction())
++		return getRetId(CF);
++	else {
++		std::string sID = getValueId(CI->getCalledValue());
++		if (sID != "")
++			return "ret." + sID;
++	}
++	return "";
++}
++
++static inline std::string getValueId(llvm::Value *V) {
++	if (llvm::Argument *A = llvm::dyn_cast<llvm::Argument>(V))
++		return getArgId(A);
++	else if (llvm::CallInst *CI = llvm::dyn_cast<llvm::CallInst>(V)) {
++		if (llvm::Function *F = CI->getCalledFunction())
++			if (F->getName().startswith("kint_arg.i"))
++				return getLoadStoreId(CI);
++		return getRetId(CI);
++	} else if (llvm::isa<llvm::LoadInst>(V) || llvm::isa<llvm::StoreInst>(V)) {
++		return getLoadStoreId(llvm::dyn_cast<llvm::Instruction>(V));
++	} else if (llvm::isa<llvm::AllocaInst>(V)) {
++		return getVarId(llvm::dyn_cast<llvm::AllocaInst>(V));
++	} else if (llvm::Instruction *I = llvm::dyn_cast<llvm::Instruction>(V)) {
++		return "unknown." + getScopeName(I);
++	}
++
++	WARNING("No Value Id for : " << *V << "\n");
++
++	return "";
++}
++
++extern bool isAllocFn(llvm::StringRef name, int *size, int *flag);
++static inline bool isAllocFn(llvm::StringRef name) {
++	int size, flag;
++	return isAllocFn(name, &size, &flag);
++}
++
++extern std::string getAnnotation(llvm::Value *V, llvm::Module *M);
++extern std::string getLoadId(llvm::LoadInst *LI);
++extern std::string getStoreId(llvm::StoreInst *SI);
++extern std::string getAnonStructId(llvm::Value *V, llvm::Module *M, llvm::StringRef Prefix);
++extern std::string getStructId(llvm::Value *PV, llvm::User::op_iterator &IS, llvm::User::op_iterator &IE,
++                               llvm::Module *M);
++
++#endif
+diff --git a/llvm_mode/Common.h b/llvm_mode/Common.h
+new file mode 100644
+index 000000000000..6816725e48b5
+--- /dev/null
++++ b/llvm_mode/Common.h
+@@ -0,0 +1,51 @@
++#ifndef _COMMON_H
++#define _COMMON_H
++
++#include <llvm/Support/raw_ostream.h>
++// #include "Flags.h"
++
++#include <unistd.h>
++#include <bitset>
++#include <chrono>
++
++#define KA_LOG(lv, stmt)							\
++	do {											\
++		llvm::errs() << stmt;					\
++	} while(0)
++
++#define RES_REPORT(stmt) KA_LOG(0, stmt);
++#define WARNING(stmt) KA_LOG(1, "\n[WARN] " << stmt);
++#define TEST_REPORT(stmt) KA_LOG(3, "[TEST] " << stmt);
++
++#define KA_ERR(stmt)															\
++	do {																		\
++		llvm::errs() << "ERROR (" << __FUNCTION__ << "@" << __LINE__ << ")";	\
++		llvm::errs() << ": " << stmt;											\
++		exit(-1);																\
++    } while(0)
++
++class Timer {
++public:
++	Timer(llvm::StringRef name) : name(name), begin(now()) {
++	}
++
++	~Timer() {
++		auto end = now();
++		auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end-begin).count();
++		llvm::errs() << "Timer on " << name << " : " << duration << " milliseconds" << "\n";
++	}
++private:
++	std::chrono::high_resolution_clock::time_point now() {
++		return std::chrono::high_resolution_clock::now();
++	}
++	llvm::StringRef name;
++	std::chrono::high_resolution_clock::time_point begin;
++};
++
++// #define FUNCTION_TIMER() Timer _t_func = Timer(__FUNCTION__)
++// #define NAMED_TIMER(name) Timer _t_named = Timer(name)
++
++#define FUNCTION_TIMER()
++#define NAMED_TIMER(name)
++
++#endif
+diff --git a/llvm_mode/Makefile b/llvm_mode/Makefile
+index 7617f914de61..1578e74c82d7 100644
+--- a/llvm_mode/Makefile
++++ b/llvm_mode/Makefile
+@@ -27,7 +27,7 @@ LLVM_CONFIG ?= llvm-config
+ CFLAGS      ?= -O3 -funroll-loops
+ CFLAGS      += -Wall -D_FORTIFY_SOURCE=2 -g -Wno-pointer-sign \
+                -DAFL_PATH=\"$(HELPER_PATH)\" -DBIN_PATH=\"$(BIN_PATH)\" \
+-               -DVERSION=\"$(VERSION)\" 
++               -DVERSION=\"$(VERSION)\" -lpthread
+ ifdef AFL_TRACE_PC
+   CFLAGS    += -DUSE_TRACE_PC=1
+ endif
+@@ -56,7 +56,7 @@ ifeq "$(origin CC)" "default"
+ endif
+ 
+ ifndef AFL_TRACE_PC
+-  PROGS      = ../afl-clang-fast ../afl-llvm-pass.so ../afl-llvm-rt.o ../afl-llvm-rt-32.o ../afl-llvm-rt-64.o
++  PROGS      = ../afl-clang-fast ../afl-llvm-pass.so ../afl-llvm-rt.o ../afl-llvm-rt-32.o ../afl-llvm-rt-64.o ../annotation-pass.so
+ else
+   PROGS      = ../afl-clang-fast ../afl-llvm-rt.o ../afl-llvm-rt-32.o ../afl-llvm-rt-64.o
+ endif
+@@ -80,8 +80,11 @@ endif
+ 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+ 	ln -sf afl-clang-fast ../afl-clang-fast++
+ 
+-../afl-llvm-pass.so: afl-llvm-pass.so.cc | test_deps
+-	$(CXX) $(CLANG_CFL) -shared $< -o $@ $(CLANG_LFL)
++../afl-llvm-pass.so: afl-llvm-pass.so.cc Annotation.cc | test_deps
++	$(CXX) $(CLANG_CFL) Annotation.cc -shared $< -o $@ $(CLANG_LFL)
++
++../annotation-pass.so: annotation-pass.so.cc Annotation.cc | test_deps
++	$(CXX) $(CLANG_CFL) Annotation.cc -shared $< -o $@ $(CLANG_LFL)
+ 
+ ../afl-llvm-rt.o: afl-llvm-rt.o.c | test_deps
+ 	$(CC) $(CFLAGS) -fPIC -c $< -o $@
+diff --git a/llvm_mode/afl-clang-fast.c b/llvm_mode/afl-clang-fast.c
+index c154e01b29f4..5bbe0e0be65d 100644
+--- a/llvm_mode/afl-clang-fast.c
++++ b/llvm_mode/afl-clang-fast.c
+@@ -126,6 +126,13 @@ static void edit_params(u32 argc, char** argv) {
+ 
+      http://clang.llvm.org/docs/SanitizerCoverage.html#tracing-pcs-with-guards */
+ 
++	if (getenv("PARSE_ANNOTATION")) {
++    cc_params[cc_par_cnt++] = "-Xclang";
++    cc_params[cc_par_cnt++] = "-load";
++    cc_params[cc_par_cnt++] = "-Xclang";
++    cc_params[cc_par_cnt++] = alloc_printf("%s/annotation-pass.so", obj_path);
++    cc_params[cc_par_cnt++] = "-D_PARSING";
++	} else {
+ #ifdef USE_TRACE_PC
+   cc_params[cc_par_cnt++] = "-fsanitize-coverage=trace-pc-guard";
+   cc_params[cc_par_cnt++] = "-mllvm";
+@@ -136,6 +143,7 @@ static void edit_params(u32 argc, char** argv) {
+   cc_params[cc_par_cnt++] = "-Xclang";
+   cc_params[cc_par_cnt++] = alloc_printf("%s/afl-llvm-pass.so", obj_path);
+ #endif /* ^USE_TRACE_PC */
++	}
+ 
+   cc_params[cc_par_cnt++] = "-Qunused-arguments";
+ 
+@@ -235,6 +243,8 @@ static void edit_params(u32 argc, char** argv) {
+   cc_params[cc_par_cnt++] = "-D__AFL_COMPILER=1";
+   cc_params[cc_par_cnt++] = "-DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION=1";
+ 
++  cc_params[cc_par_cnt++] = alloc_printf("-include%s/llvm_mode/afl-rt.h", obj_path);
++
+   /* When the user tries to use persistent or deferred forkserver modes by
+      appending a single line to the program, we want to reliably inject a
+      signature into the binary (to be picked up by afl-fuzz) and we want
+diff --git a/llvm_mode/afl-llvm-pass.so.cc b/llvm_mode/afl-llvm-pass.so.cc
+index 154a5db75754..1f6f823cc8ee 100644
+--- a/llvm_mode/afl-llvm-pass.so.cc
++++ b/llvm_mode/afl-llvm-pass.so.cc
+@@ -33,7 +33,10 @@
+ 
+ #include "../config.h"
+ #include "../debug.h"
++#include "Annotation.h"
+ 
++#include <set>
++#include <fstream>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <unistd.h>
+@@ -47,6 +50,8 @@
+ 
+ using namespace llvm;
+ 
++typedef std::set<std::string> StringSet;
++
+ namespace {
+ 
+   class AFLCoverage : public ModulePass {
+@@ -54,9 +59,20 @@ namespace {
+     public:
+ 
+       static char ID;
++	std::string SVListFilePath;
++	StringSet StateValIDSet;
++	llvm::GlobalVariable *AFLStateRangePtr;
++	std::map<int, int> SV2CountMap;
++	int sv_cnt;
++	int inst_store;
++
+       AFLCoverage() : ModulePass(ID) { }
+ 
+       bool runOnModule(Module &M) override;
++	bool runOnFunction(Function &F);
++	void loadStateVar();
++	void InjectTraceForSVList(Function &F,
++		std::set<std::pair<StoreInst *, u32>> StoreTraceTargets);
+ 
+       // StringRef getPassName() const override {
+       //  return "American Fuzzy Lop Instrumentation";
+@@ -81,6 +97,8 @@ bool AFLCoverage::runOnModule(Module &M) {
+ 
+   char be_quiet = 0;
+ 
++	SVListFilePath = DEFAULT_SVLIST_PATH;
++
+   if (isatty(2) && !getenv("AFL_QUIET")) {
+ 
+     SAYF(cCYA "afl-llvm-pass " cBRI VERSION cRST " by <lszekeres@google.com>\n");
+@@ -111,11 +129,18 @@ bool AFLCoverage::runOnModule(Module &M) {
+       M, Int32Ty, false, GlobalValue::ExternalLinkage, 0, "__afl_prev_loc",
+       0, GlobalVariable::GeneralDynamicTLSModel, 0, false);
+ 
++	AFLStateRangePtr = new GlobalVariable(M, PointerType::get(Int8Ty, 0),
++                                            false, GlobalValue::ExternalLinkage,
++                                            0, "__afl_area_sv_range_ptr");
++
++	loadStateVar();
++
+   /* Instrument all the things! */
+ 
+   int inst_blocks = 0;
++	inst_store = 0;
+ 
+-  for (auto &F : M)
++  for (auto &F : M) {
+     for (auto &BB : F) {
+ 
+       BasicBlock::iterator IP = BB.getFirstInsertionPt();
+@@ -159,6 +184,8 @@ bool AFLCoverage::runOnModule(Module &M) {
+       inst_blocks++;
+ 
+     }
++	runOnFunction(F);
++}
+ 
+   /* Say something nice. */
+ 
+@@ -176,6 +203,106 @@ bool AFLCoverage::runOnModule(Module &M) {
+ 
+ }
+ 
++void AFLCoverage::loadStateVar() {
++    std::ifstream StateVarFile;
++
++    // string SVListFilePath = InputFilename;
++
++    StateVarFile.open(SVListFilePath);
++
++    std::string SV;
++    sv_cnt = 0;
++    std::hash<std::string> hasher;
++
++    while (getline(StateVarFile, SV)) {
++        StateValIDSet.insert(SV);
++		u16 hash_value = hasher(SV);
++		SV2CountMap[hash_value] = sv_cnt;
++		sv_cnt++;
++	}
++
++    StateVarFile.close();
++
++    return;
++}
++
++bool AFLCoverage::runOnFunction(Function &F) {
++
++    std::set<std::pair<StoreInst *, u32>> StoreTraceTargets;
++
++    std::hash<std::string> hasher;
++
++    for (auto &BB : F) {
++        for (auto &I : BB) {
++            if (StoreInst *S = dyn_cast<StoreInst>(&I)) {
++                std::string StoreInstID = getStoreId(S);
++
++                if (StateValIDSet.count(StoreInstID)) {
++
++                    u32 hash_value = hasher(StoreInstID);
++
++                    StoreTraceTargets.insert({S, hash_value});
++                }
++            }
++        }
++    }
++
++    InjectTraceForSVList(F, StoreTraceTargets);
++
++    return true;
++}
++
++void AFLCoverage::InjectTraceForSVList(
++    Function &F, std::set<std::pair<StoreInst *, u32>> StoreTraceTargets) {
++
++    Module *M = F.getParent();
++
++    LLVMContext &C = M->getContext();
++
++    IntegerType *Int8Ty = IntegerType::getInt8Ty(C);
++    IntegerType *Int32Ty = IntegerType::getInt32Ty(C);
++
++    for (auto StorePair : StoreTraceTargets) {
++        StoreInst *StoreInst = StorePair.first;
++        u16 hash_value = StorePair.second;
++        IRBuilder<> IRB(StoreInst);
++        // Value *addr = StoreInst->getArgOperand(0);
++        Value *StoreVal = StoreInst->getValueOperand();
++
++        // hash SID of StoreInst
++        // map {hash[SID]} to bitmap index, i.e. [0, 65535]
++
++        // Int16Ty would lead to an signed int16 cast and reture a negative
++        // value, not work.
++        // ConstantInt *HashVar = ConstantInt::get(Int32Ty, hash_value);
++
++        // /* Load SHM pointer */
++        // LoadInst *DataMapPtr = IRB.CreateLoad(AFLStateMapPtr);
++        // DataMapPtr->setMetadata(M->getMDKindID("nosanitize"),
++        //                         MDNode::get(C, None));
++        // ACTF("hash value: %u, store variable id: %s\n", hash_value,
++        //      getStoreId(StoreInst).c_str());
++
++        // Value *DataMapPtrIdx = IRB.CreateGEP(DataMapPtr, HashVar);
++
++        // /* Update bitmap */
++
++        // IRB.CreateStore(StoreVal, DataMapPtrIdx)
++        //     ->setMetadata(M->getMDKindID("nosanitize"), MDNode::get(C, None));
++
++        inst_store++;
++
++		auto *sv_range_ptr = IRB.CreateLoad(AFLStateRangePtr);
++		sv_range_ptr->setMetadata(M->getMDKindID("nosanitize"),
++                                  MDNode::get(C, None));
++		auto *add_inst = IRB.CreateAdd(StoreVal,
++				ConstantInt::get(Int32Ty, SV2CountMap[hash_value] * (1 << 16)));
++		auto *sv_range_ptr_idx = IRB.CreateGEP(sv_range_ptr, add_inst);
++		IRB.CreateStore(llvm::ConstantInt::get(Int8Ty, 1), sv_range_ptr_idx)
++            ->setMetadata(M->getMDKindID("nosanitize"), MDNode::get(C, None));
++
++    }
++}
+ 
+ static void registerAFLPass(const PassManagerBuilder &,
+                             legacy::PassManagerBase &PM) {
+diff --git a/llvm_mode/afl-llvm-rt.o.c b/llvm_mode/afl-llvm-rt.o.c
+index 60475c933073..6ba697dc6485 100644
+--- a/llvm_mode/afl-llvm-rt.o.c
++++ b/llvm_mode/afl-llvm-rt.o.c
+@@ -59,6 +59,8 @@
+ 
+ u8  __afl_area_initial[MAP_SIZE];
+ u8* __afl_area_ptr = __afl_area_initial;
++u8  __afl_area_sv_range[SV_CNT * MAP_SIZE];
++u8* __afl_area_sv_range_ptr = __afl_area_sv_range;
+ 
+ __thread u32 __afl_prev_loc;
+ 
+@@ -95,6 +97,15 @@ static void __afl_map_shm(void) {
+ 
+   }
+ 
++	u8 *state_range_id_str = getenv(SHM_STATE_RANGE_VAR);
++	if (state_range_id_str) {
++		u32 shm_state_range_id = atoi(state_range_id_str);
++		__afl_area_sv_range_ptr = shmat(shm_state_range_id, NULL, 0);
++		if (__afl_area_sv_range_ptr == (void *)-1) {
++			_exit(1);
++		}
++	}
++
+ }
+ 
+ 
+diff --git a/llvm_mode/afl-rt.h b/llvm_mode/afl-rt.h
+new file mode 100644
+index 000000000000..e1a9ee59bfc2
+--- /dev/null
++++ b/llvm_mode/afl-rt.h
+@@ -0,0 +1,18 @@
++#pragma once
++#ifndef _NO__IN_ASM
++#if defined(__cplusplus)
++extern "C" {
++#endif
++
++#ifdef _PARSING
++#define _STATE_VARIABLE(x) x __attribute__((annotate("STATE_VARIABLE")))
++#else
++#define _STATE_VARIABLE(x) x
++#endif
++
++#define __SYNC() raise(SIGSTOP)
++
++#if defined(__cplusplus)
++}
++#endif
++#endif
+diff --git a/llvm_mode/annotation-pass.so.cc b/llvm_mode/annotation-pass.so.cc
+new file mode 100644
+index 000000000000..a78295ce4071
+--- /dev/null
++++ b/llvm_mode/annotation-pass.so.cc
+@@ -0,0 +1,305 @@
++#define AFL_LLVM_PASS
++
++#include "../config.h"
++#include "../debug.h"
++#include "Annotation.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <fstream>
++
++#include "llvm/ADT/Statistic.h"
++#include "llvm/IR/IRBuilder.h"
++#include "llvm/IR/LegacyPassManager.h"
++#include "llvm/IR/Module.h"
++#include "llvm/IRReader/IRReader.h"
++#include "llvm/Passes/PassBuilder.h"
++#include "llvm/Support/CommandLine.h"
++#include "llvm/Support/Debug.h"
++#include "llvm/Support/SourceMgr.h"
++#include "llvm/Support/raw_ostream.h"
++#include "llvm/Transforms/IPO/PassManagerBuilder.h"
++#include <llvm/IR/DebugInfo.h>
++
++using namespace llvm;
++using namespace std;
++
++typedef set<string> StringSet;
++typedef map<string, s16> GVInitializer;
++
++namespace {
++
++  class AnnotationParse : public ModulePass {
++
++    public:
++      static char ID;
++      StringSet StateValIDSet;
++      StringSet IndexSet;
++      int sv_num = 0;
++      
++      AnnotationParse() : ModulePass(ID) { }
++
++      bool runOnModule(Module &M) override;
++      void loadStateVar();
++      void dumpStateVar();
++
++  };
++
++}
++
++
++char AnnotationParse::ID = 0;
++
++
++bool AnnotationParse::runOnModule(Module &M) {
++
++  char be_quiet = 0;
++
++  if (isatty(2) && !getenv("AFL_QUIET")) {
++
++    SAYF(cCYA "annotation-pass " cBRI VERSION cRST " parsing state annotation...\n");
++
++  } else be_quiet = 1;
++  
++  loadStateVar();
++
++  for (auto &F : M) {
++
++    for (auto &BB : F) {
++
++      for (auto &I : BB) {
++
++        // errs() << I << "\n";
++
++        if (StoreInst *S = dyn_cast<StoreInst>(&I)) {
++
++          // errs() << "\nStoreInst: " << *S << "\n";
++
++          // string VariableID = getStoreId(S);
++
++          Value *V = S->getPointerOperand();
++
++          // errs() << "VariableID: " << VariableID << "\n";
++
++          // errs() << "Variable: " << *V << "\n";
++
++          /* Most cases: global variable */
++          if (GlobalVariable *GV = dyn_cast<GlobalVariable>(V)) {
++            
++            string VariableID = getStoreId(S);
++
++            // errs() << "Global Variable, id: " << VariableID << "\n";
++
++            for (Module::global_iterator GI = M.global_begin(), GE = M.global_end(); GI != GE; ++GI) {
++
++              if (GI->getName() == "llvm.global.annotations") {
++
++                ConstantArray *CA = dyn_cast<ConstantArray>(GI->getOperand(0));
++
++                for(auto OI = CA->op_begin(); OI != CA->op_end(); ++OI) {
++                  
++                  ConstantStruct *CS = dyn_cast<ConstantStruct>(OI->get());
++                  
++                  // errs() << *CS << "\n";
++
++                  GlobalVariable *CGV;
++
++                  if (dyn_cast<GlobalVariable>(CS->getOperand(0))) {
++                    
++                    CGV = dyn_cast<GlobalVariable>(CS->getOperand(0));// OKF("extract GV: %s\n");
++
++                    // errs() << "extract GV: " << *CS->getOperand(0) << "\n";
++
++                  } else if (dyn_cast<GlobalVariable>(CS->getOperand(0)->getOperand(0))) {
++
++                    CGV = dyn_cast<GlobalVariable>(CS->getOperand(0)->getOperand(0));
++
++                    // errs() << "extract GV: " << *CS->getOperand(0)->getOperand(0) << "\n";
++
++                  } else {
++
++                    FATAL("CAN NOT EXTRACT GV ANNOTATION, CHECK THE BUG!");
++
++                  }
++
++                  GlobalVariable *AnnotationGL = dyn_cast<GlobalVariable>(CS->getOperand(1)->getOperand(0));
++
++                  // errs() << "anno: " << *AnnotationGL << "\n";
++
++                  StringRef annotation = dyn_cast<ConstantDataArray>(AnnotationGL->getInitializer())->getAsCString();
++
++                  // errs() << annotation << "\n";
++
++                  if(annotation.compare("STATE_VARIABLE") == 0 && GV == CGV) {
++
++                    ACTF("Find annotations");
++
++                    OKF("Global Variable Type, id: %s", VariableID.c_str());
++
++                    if (!StateValIDSet.count(VariableID)) {
++
++                      StateValIDSet.insert(VariableID);
++
++                      sv_num++;
++
++                    }
++
++                    if (ConstantInt *Constval = dyn_cast<llvm::ConstantInt>(GV->getInitializer())) {
++
++                      // OKF("Variable id: %s, init value: %ld", VariableID.c_str(), Constval->getSExtValue());
++
++                      hash<string> hasher;
++
++                      u16 hash_value = hasher(VariableID);
++
++                      ACTF("hash value: %u, store var: %s", hash_value, VariableID.c_str());
++
++                      // string Index = to_string(hash_value ^ s16(Constval->getSExtValue()) + 32768);
++                      string Index = to_string(hash_value);
++
++                      OKF("shared memory index: %s, init value: %ld", Index.c_str(), Constval->getSExtValue());
++
++                      Index = Index + "," + to_string(Constval->getSExtValue());
++
++                      if (!IndexSet.count(Index)) {
++
++                          IndexSet.insert(Index);
++
++                      }
++                    }
++                  }
++                }
++              }
++            }
++            continue;
++          }
++
++          /* LightFTP case: store <- bitcast <- call
++            %73 = call i8* @llvm.ptr.annotation.p0i8(i8* %72, i8* getelementptr inbounds ([13 x i8], [13 x i8]* @.str, i32 0, i32 0), i8* getelementptr inbounds ([12 x i8], [12 x i8]* @.str.1, i32 0, i32 0), i32 91), !dbg !792
++            %74 = bitcast i8* %73 to i32*, !dbg !792
++            store i32 0, i32* %74, align 4, !dbg !793 */
++          if (BitCastInst *BC = dyn_cast<BitCastInst>(V)) {
++
++              // errs() << "Variable used by BitCastInst: " << *BC << "\n";
++
++              V = BC->getOperand(0);
++
++              // errs() << "BastCastVariable: " << *V << "\n";
++          }
++
++          /* Normal bftpd case: store <- call
++            %18 = call i8* @llvm.ptr.annotation.p0i8(i8* %17, i8* getelementptr inbounds ([13 x i8], [13 x i8]* @.str.6, i32 0, i32 0), i8* getelementptr inbounds ([14 x i8], [14 x i8]* @.str.7, i32 0, i32 0), i32 10), !dbg !226
++            store i8 1, i8* %18, align 8, !dbg !228 */
++          if (CallInst *C = dyn_cast<CallInst>(V)) {
++
++            // errs() << "Variable used by CallInst: " << *C << "\n";
++
++            if (C->isInlineAsm())
++                continue;
++
++            Function *Fun = C->getCalledFunction();
++
++            if (Fun && (Fun->getName().startswith("llvm.ptr.annotation"))) {
++              
++              // errs() << "Used variable: " << *C->getOperand(0) << "\n";
++
++              string VariableID = getAnnotation(C->getOperand(0), &M);
++
++              ACTF("Find annotations");
++
++              OKF("Struct Member Variable, id: %s\n", VariableID.c_str());
++
++              if (!StateValIDSet.count(VariableID)) {
++
++                  StateValIDSet.insert(VariableID);
++
++                  sv_num++;
++
++              }
++            }
++          }
++        } 
++      }
++    }
++  }
++
++  dumpStateVar();
++
++  /* Say something nice. */
++
++  if (!be_quiet) {
++
++    if (!sv_num) WARNF("No annotated state variable found.");
++    else OKF("Found %d state variable for now.", sv_num);
++
++  }
++
++  return true;
++
++}
++
++void AnnotationParse::loadStateVar() {
++
++  ifstream StateVarFile, GVIndexFile;
++
++  StateVarFile.open(DEFAULT_SVLIST_PATH);
++
++  GVIndexFile.open(DEFAULT_GINDEX_PATH);
++
++  string SV;
++
++  while (getline(StateVarFile, SV)) {
++
++    StateValIDSet.insert(SV);
++
++    sv_num++;
++
++  }
++
++  string Index;
++
++  while (getline(GVIndexFile, Index)) {
++
++      IndexSet.insert(Index);
++
++  }
++
++  StateVarFile.close();
++
++  return;
++}
++
++void AnnotationParse::dumpStateVar() {
++
++  ofstream StateVarFile, GVIndexFile;
++
++  StateVarFile.open(DEFAULT_SVLIST_PATH);
++
++  GVIndexFile.open(DEFAULT_GINDEX_PATH);
++
++  for (auto InstID : StateValIDSet)
++    StateVarFile << InstID << "\n";
++
++  for (auto Index: IndexSet)
++    GVIndexFile << Index << "\n";
++
++  StateVarFile.close();
++  GVIndexFile.close();
++
++  return;
++}
++
++static void registerPass(const PassManagerBuilder &,
++                            legacy::PassManagerBase &PM) {
++
++  PM.add(new AnnotationParse());
++
++}
++
++
++static RegisterStandardPasses RegisterPass(
++    PassManagerBuilder::EP_ModuleOptimizerEarly, registerPass);
++
++static RegisterStandardPasses RegisterPass0(
++    PassManagerBuilder::EP_EnabledOnOptLevel0, registerPass);

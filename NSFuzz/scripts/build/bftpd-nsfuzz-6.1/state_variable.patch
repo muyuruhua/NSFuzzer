@@ -1,0 +1,26 @@
+--- bftpd/commands.c	2022-01-29 01:55:18.000000000 +0800
++++ bftpd-nsfuzz-patch/commands.c	2026-04-12 14:52:55.178345722 +0800
+@@ -61,19 +61,19 @@
+ #undef WANT_GZIP
+ #endif
+ 
+-int state = STATE_CONNECTED;
++int _STATE_VARIABLE(state) = STATE_CONNECTED;
+ char user[USERLEN + 1];
+ struct sockaddr_in sa;
+-char pasv = 0;
++char _STATE_VARIABLE(pasv) = 0;
+ int sock;
+ int pasvsock = -1;
+ char *philename = NULL;
+ unsigned long offset = 0;
+-short int xfertype = TYPE_BINARY;
++short int _STATE_VARIABLE(xfertype) = TYPE_BINARY;
+ int ratio_send = 1, ratio_recv = 1;
+ /* long unsigned bytes_sent = 0, bytes_recvd = 0; */
+ double bytes_sent = 0.0, bytes_recvd = 0.0;
+-int epsvall = 0;
++int _STATE_VARIABLE(epsvall) = 0;
+ int xfer_bufsize;
+ 
+ 

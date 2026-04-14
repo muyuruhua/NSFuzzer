@@ -1,0 +1,263 @@
+The evaluation results presented by NSFuzz can be divided into two parts, static analysis and fuzzing, and we will explain how these results are generated and how they are analyzed separately.
+
+1 Data Generation
+
+1.1 Static Analysis
+
+We will reproduce the results of the static analysis according to the following steps:
+
+(1) Run an instance of the docker image:
+
+    docker run -itd --name static-analysis-container --privileged static-analysis /bin/bash
+
+(2) Exec the containter:
+
+    docker exec -it static-analysis-container /bin/bash
+
+(3) Perform static analysis:
+
+	/home/ubuntu/static-analysis.sh
+
+This step takes about ten minutes. After the above steps, the results will be stored in three newly created folders at /home/ubuntu, i.e., analysis_time, state_variable, and sync_point.
+
+1.2 Fuzzing
+
+The script to perform fuzzing is evaluation/scripts/execution/profuzzbench_exec_all.sh. It is used in the following ways:
+
+	cd scripts/execution
+	NUM_CONTAINERS=number_of_containers ./profuzzbench_exec_all.sh target fuzzer fuzzing_output_directory timeout
+
+The meaning of each argument is as follows:
+
+    number_of_containers: 		It is the number of containers running in parallel.
+    target: 					The fuzzing target that you choose, e.g.: tinydtls.
+    fuzzer: 					The fuzzer that you want to evaluate, e.g: nsfuzz. The special option "all" allows to evaluate all fuzzers at the same time.
+    fuzzing_output_directory: 	The directory that stores the fuzzing result.
+    timeout: 					The time to run the experiment, in seconds.
+
+For example, if we want to evaluate the performance of all fuzzers on the target tinydtls for 24 hours (86400s) in 6 parallel containers, we can use the following command:
+
+```
+NUM_CONTAINERS=6 ./profuzzbench_exec_all.sh "tinydtls" "all" results-tinydtls 86400
+```
+
+Note that to ensure the fairness of the evaluation, for every target, we start all fuzzers at the same time, i.e., use "all" in the "target" argument.
+
+To avoid random factors during the experiment, we recommend conducting only one run for each target instead of four runs as we did in the paper. Besides, while we showed the results of 24 hours of running in the paper, we suggest running 6 hours to get the approximate results for the artifacts evaluation in case of any unexpected accident and save your time.
+
+In summary, we recommend using the following commands to run the artifacts evaluation:
+
+	NUM_CONTAINERS=1 ./profuzzbench_exec_all.sh "tinydtls" "all" tinydtls 21600
+	NUM_CONTAINERS=1 ./profuzzbench_exec_all.sh "bftpd" "all" bftpd 21600
+	NUM_CONTAINERS=1 ./profuzzbench_exec_all.sh "dcmtk" "all" dcmtk 21600
+	NUM_CONTAINERS=1 ./profuzzbench_exec_all.sh "live555" "all" live555 21600
+	NUM_CONTAINERS=1 ./profuzzbench_exec_all.sh "exim" "all" exim 21600
+	NUM_CONTAINERS=1 ./profuzzbench_exec_all.sh "kamailio" "all" kamailio 21600
+	NUM_CONTAINERS=1 ./profuzzbench_exec_all.sh "forked-daapd" "all" forked-daapd 21600
+	NUM_CONTAINERS=1 ./profuzzbench_exec_all.sh "proftpd" "all" proftpd 21600
+	NUM_CONTAINERS=1 ./profuzzbench_exec_all.sh "lightftp" "all" lightftp 21600
+	NUM_CONTAINERS=1 ./profuzzbench_exec_all.sh "pure-ftpd" "all" pure-ftpd 21600
+	NUM_CONTAINERS=1 ./profuzzbench_exec_all.sh "openssl" "all" openssl 21600
+	NUM_CONTAINERS=1 ./profuzzbench_exec_all.sh "dnsmasq" "all" dnsmasq 21600
+	NUM_CONTAINERS=1 ./profuzzbench_exec_all.sh "openssh" "all" openssh 21600
+
+- There are several things to note for the running of the fuzzing process:
+
+- Evaluate the computing resources before you start running the experiment. We recommend reserving one core for each container, that is, the number of containers that start at the same time do not exceed the number of cores of the computer.
+
+- Although we recommend running the fuzzing for 6 hours, you can also use other values of running time as you wish by setting the value of the last parameter.
+
+- It should be noted that you can execute ctrl+c to exit the currently executing command because it will automatically run in the background and print relevant information after it is finished.
+
+- You should better not change the name of the fuzzing_output_directory which will be further used in the analyzing process.
+
+- After the containers start to run, you’d better run docker ps to check if any container exited early. If everything goes well, you will see 13*5 running containers named after the target where 5 represents the number of fuzzers. For example, the results of docker ps | grep tinydtls will be like this:
+
+  ```
+  $docker ps | grep tinydtls
+  tinydtls
+  tinydtls
+  tinydtls-nsfuzz
+  tinydtls-nsfuzz-v
+  tinydtls-stateafl
+  ```
+
+- If any container exited immediately after starting up, you should start new experiments for that target again.Remember to stop the other containers of that target first using the following command and then restart again.
+
+  ```
+  docker stop `docker ps -a|grep target|awk '{print $1}'`
+  ```
+
+- The messages printed in the terminal can be a bit messy, you can just leave them alone.
+
+- The total time of running will be larger than the value of timeout and may be even twice of it. The reason is that after the fuzzing process stopped, the gcov process will start to collect the results of code coverage. This means if you choose to run 6 hours of fuzzing, it may take you up to 12 hours to collect all the results.
+
+
+
+2 Data Analysis
+
+2.1 Static Analysis
+
+We will analyze the results of the static analysis using the following steps:
+
+(1) Execute the container:    
+
+```
+docker exec -it static-analysis-container /bin/bash
+```
+
+(2) Generate the result:    
+
+```
+python3 /home/ubuntu/generate\_result.py
+```
+
+The results will be saved in the newly created file /home/ubuntu/result.csv, which saves the results of analysis time, the number of state variables, and the number of synchronization points for each target.
+
+2.2 Fuzzing
+
+After collecting the results of fuzzing, we will further analyze the results using the following steps:
+
+(1) Check the integrity of data manually: To avoid the impact of random factors, we need to check the completeness of the results first. If only one container is set as recommended, the output folder of TinyDTLS should include the following 10 files:
+
+    out-tinydtls-aflnet\_1.tar.gz
+    out-tinydtls-aflnet\_sv\_range\_1.json
+    out-tinydtls-aflnwe\_1.tar.gz
+    out-tinydtls-aflnwe\_sv\_range\_1.json
+    out-tinydtls-nsfuzz\_1.tar.gz
+    out-tinydtls-nsfuzz\_sv\_range\_1.json
+    out-tinydtls-nsfuzz-v\_1.tar.gz
+    out-tinydtls-nsfuzz-v\_sv\_range\_1.json
+    out-tinydtls-stateafl\_1.tar.gz 
+
+If the value of number_of_containers is larger than 1, for example, number_of_containers = 4, the number
+of files in each folder will be 40 and organized like this:
+
+```
+out-tinydtls-aflnet_1.tar.gz
+out-tinydtls-aflnet_2.tar.gz
+out-tinydtls-aflnet_3.tar.gz
+out-tinydtls-aflnet_4.tar.gz
+out-tinydtls-aflnet_sv_range_1.json
+out-tinydtls-aflnet_sv_range_2.json
+out-tinydtls-aflnet_sv_range_3.json
+out-tinydtls-aflnet_sv_range_4.json
+...
+out-tinydtls-stateafl_sv_range_1.json
+out-tinydtls-stateafl_sv_range_2.json
+out-tinydtls-stateafl_sv_range_3.json
+out-tinydtls-stateafl_sv_range_4.jso
+```
+
+If any of the expected files are missing, it is most probably affected by the random factor and you need to run the corresponding experiments again to get the full results.
+
+(2) Move the result directory:
+
+To process the results, move the results to scripts/analysis and rename them after the corresponding target. Use similar commands like this
+
+    cd scripts
+    mv execution/tinydtls analysis/tinydtls
+    mv execution/bftpd analysis/bftpd
+    mv execution/dcmtk analysis/dcmtk
+    mv execution/live555 analysis/live555
+    mv execution/exim analysis/exim
+    mv execution/kamailio analysis/kamailio
+    mv execution/forked-daapd analysis/forked-daapd
+    mv execution/proftpd analysis/proftpd
+    mv execution/lightftp analysis/lightftp
+    mv execution/pure-ftpd analysis/pure-ftpd
+    mv execution/openssl analysis/openssl
+    mv execution/openssh analysis/openssh
+    mv execution/dnsmasq analysis/dnsmasq
+
+(3) Create the database: We use the script create-database.py in the scripts/analysis folder to create the database of all data.
+Before creating the database, we need to execute the following command to correct one state variable name in out-dcmtk-nsfuzz_sv_range_*.json  due to some coding problem that is inconvenient to correct.
+
+    cd scripts/analysis
+    sed -i "s/121default/1L21default/g" dcmtk/*.json
+
+Then run the following command:
+
+```
+python3 create-database.py -t timeout -r runs -o output_dir
+```
+
+The arguments of the command are as follows:
+• timeout: The time for the running of the experiment, in seconds.
+• runs: The number of containers in parallel.
+• output_dir: The directory to store the analysis result.
+You can directly run the following command
+
+```
+python3 create-database.py -t 21600 -r 1 -o result-all
+```
+
+You may see the information printed in the terminal like this:
+
+```
+$ python3 create-database.py -s all -t 21600 -r 4 -o result-all
+Saving extracted data...
+Finished creating database-all.json. Timecost: 229.7675814628601.
+Processing cov data of lightftp.
+Processing cov data of bftpd.
+Processing cov data of pure-ftpd.
+Processing cov data of proftpd.
+Processing cov data of dnsmasq.
+Processing cov data of tinydtls.
+Processing cov data of exim.
+Processing cov data of kamailio.
+Processing cov data of openssh.
+Processing cov data of openssl.
+Processing cov data of forked-daapd.
+Processing cov data of live555.
+Processing cov data of dcmtk.
+Collecting cov data of all targets.
+Finished creating coverage-all.csv. Timecost: 140.60461950302124.
+```
+
+It takes about 5 minutes to finish the program and two files are created in the folder result-all, i.e., coverage-all.csv which stores the coverage data of all targets, and database-all.json which contains all other information.
+
+(4) Generate the result: We will use the script process-data.py in the scripts/analysis folder, and the following command generates the results:
+
+    python3 process-data.py -o output_dir -f database-all.json -cov coverage-all.csv -t timeout -r runs -s subject
+
+The arguments of the command are as follows:
+• output_dir: The directory that stores the database and results.
+• database-all.json: The json file generated just now.
+• coverage-all.csv: The csv file generated just now.
+• timeout: The time for the running of the experiment, in seconds.
+• runs: The number of containers in parallel.
+
+You can directly use the following command:
+
+```
+python3 process-data.py -o result-all -f ./result-all/database-all.json -cov ./result-all/coverage-all.csv -t 21600 -r 1
+```
+
+You may see the information printed in the terminal like this
+
+```
+$ python3 process-data.py -f ./result-all/database-all.json -o result-all -cov ./ result-all/coverage-all.csv -t 86400 -r 4
+Database loaded.
+Finished: ./result-all/table-throughput-improvement.csv
+Finished: ./result-all/table-state-model-vertex-edge.csv
+Finished: ./result-all/table-code-coverage-improvement.csv
+Finished: ./result-all/fig-coverage.pdf
+Finished: ./result-all/table-crash-time.csv
+Finished: ./result-all/fig-sv-coverage.pdf
+```
+
+It takes about one minute to finish this program. After the program exited normally, we will see the following result files in folder result-all:
+
+```
+coverage-all.csv
+database-all.json
+fig-coverage.pdf
+fig-sv-coverage.pdf
+table-throughput-improvement.csv
+table-code-coverage-improvement.csv
+table-state-model-vertex-edge.csv
+table-crash-time.csv
+```
+
+Then you can verify the created files with the results in the paper according to the RCR report.

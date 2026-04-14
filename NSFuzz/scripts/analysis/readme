@@ -1,0 +1,29 @@
+0. pre-process
+replace 'var._globinit._ZN5dcmtk9log4cplus12_GLOBAL__N_121default_context_stateE' with 'var._globinit._ZN5dcmtk9log4cplus12_GLOBAL__N_1L21default_context_stateE' in ./dcmtk/out-dcmtk-nsfuzz*.json
+
+save results of each target in one folder named of target name
+drwxrwxr-x  2 hufan hufan 12288 9月  18 21:53 forked-daapd/
+drwxrwxr-x  2 hufan hufan 12288 9月  18 21:53 dcmtk/
+drwxrwxr-x  2 hufan hufan 12288 9月  18 21:53 dnsmasq/
+drwxrwxr-x  2 hufan hufan 12288 9月  18 21:53 tinydtls/
+drwxrwxr-x  2 hufan hufan 12288 9月  18 21:54 lightftp/
+drwxrwxr-x  2 hufan hufan  4096 9月  18 21:53 bftpd/
+drwxrwxr-x  2 hufan hufan 12288 9月  18 21:54 proftpd/
+drwxrwxr-x  2 hufan hufan 12288 9月  18 21:55 pure-ftpd/
+drwxrwxr-x  2 hufan hufan 12288 9月  18 21:56 kamailio/
+drwxrwxr-x  2 hufan hufan 20480 9月  18 21:55 live555/
+drwxrwxr-x  2 hufan hufan 12288 9月  18 21:56 exim/
+drwxrwxr-x  2 hufan hufan 12288 9月  18 21:56 openssh/
+drwxrwxr-x  2 hufan hufan 12288 9月  18 21:56 openssl/
+-rw-rw-r--  1 hufan hufan 13582 9月  18 22:00 create-database.py
+-rw-rw-r--  1 hufan hufan 21614 9月  19 14:04 process-data.py
+-rw-rw-r--  1 hufan hufan  2827 9月   6 22:02 sv_info.csv
+-rwxrwxr-x  1 hufan hufan   654 9月  13 12:27 time-aflnwe.sh*
+-rwxrwxr-x  1 hufan hufan   676 9月  13 12:27 time.sh*
+-rw-rw-r--  1 hufan hufan   678 9月  19 14:06 readme
+
+1. create database
+python3 create-database.py -s all -t 86400 -r 4 -o result-all
+
+2. process data
+python3 process-data.py -o result-all -f ./result-all/database-all.json -cov ./result-all/coverage-all.csv -t 86400 -r 4
